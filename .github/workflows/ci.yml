@@ -38,10 +38,13 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # GitHub 的 ubuntu-latest 镜像自带 Android SDK（ANDROID_HOME 已设），
-      # 但自带镜像里的 platform / build-tools 版本会随镜像更新而变，
-      # 所以这里显式补装我们构建所需的固定版本，保证构建可复现。
-      - name: Install Android SDK platform & build-tools
+      # ⚠️ 关键：build.sh 用 `sort -V | tail -1` 挑选 build-tools 与 android.jar，
+      #   也就是「取最高版本」。而 ubuntu-latest 镜像预装了 android-37.2 / build-tools 37.0.0
+      #   （版本随镜像滚动更新），不加约束会直接用它们构建 —— 结果不可复现，
+      #   且 android.jar 一换，编译期 API 面就跟着变。
+      #   这里先删掉镜像里那些「比 34 更高」的版本，只留我们锁定的 34，
+      #   再补装固定的 NDK，从而把整条工具链钉死在 34.0.0 / android-34 / NDK 26.1。
+      - name: Pin Android SDK versions (build-tools 34.0.0 / android-34)
         run: |
           set -euo pipefail
           SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
@@ -50,14 +53,33 @@ jobs:
             exit 1
           fi
           echo "ANDROID_HOME=$SDK"
+
+          # 1) 清掉镜像自带的、高于 34 的 platform 与 build-tools，避免被 build.sh 的
+          #    "取最高版本" 逻辑选中。android-34 若已存在则保留。
+          shopt -s nullglob
+          for d in "$SDK"/platforms/android-*; do
+            v="$(basename "$d")"
+            case "$v" in
+              android-34|android-34.*) echo "keep $v" ;;
+              *) echo "remove $v"; rm -rf "$d" ;;
+            esac
+          done
+          for d in "$SDK"/build-tools/*; do
+            v="$(basename "$d")"
+            if [[ "$v" == "34.0.0" ]]; then echo "keep build-tools $v"; else echo "remove build-tools $v"; rm -rf "$d"; fi
+          done
+
+          # 2) 补装锁定版本（已存在则为幂等空操作）。
           SDKMGR="$(ls "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -1)"
-          if [[ -z "$SDKMGR" ]]; then
-            echo "::error::找不到 sdkmanager"
-            exit 1
-          fi
+          [[ -n "$SDKMGR" ]] || { echo "::error::找不到 sdkmanager"; exit 1; }
           yes | "$SDKMGR" --licenses >/dev/null 2>&1 || true
           "$SDKMGR" "platforms;android-34" "build-tools;34.0.0" "ndk;26.1.10909125"
+
+          # 3) 显式导出，让 build.sh 不再依赖自动探测。
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$SDK/ndk/26.1.10909125" >> "$GITHUB_ENV"
+          echo "ANDROID_JAR=$SDK/platforms/android-34/android.jar" >> "$GITHUB_ENV"
 
       - name: Show toolchain versions
         run: |
@@ -65,21 +87,38 @@ jobs:
           echo "JAVA_HOME=$JAVA_HOME"
           java -version
           echo "---"
+          echo "ANDROID_HOME=$ANDROID_HOME"
           echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          echo "ANDROID_JAR=$ANDROID_JAR"
           ls "$ANDROID_HOME/platforms"
           ls "$ANDROID_HOME/build-tools"
 
       # build.sh 会自动探测 JAVA_HOME / ANDROID_HOME / ANDROID_NDK_HOME / android.jar，
       # 找不到 keystore 时自动生成 debug.keystore 并用 debug key 签名。
+      # 这里把 build.sh 的输出同时 tee 到文件，供下一步做工具链断言。
       - name: Build
         run: |
           set -euo pipefail
           chmod +x ./build.sh
-          ./build.sh
+          ./build.sh 2>&1 | tee build_log.txt
 
       - name: Collect outputs
         run: |
           set -euo pipefail
+
+          # 断言：必须命中锁定的工具链，否则宁可失败也不产出「版本漂移」的包。
+          if ! grep -q "Build-Tools = .*/build-tools/34\.0\.0" build_log.txt; then
+            echo "::error::构建未使用锁定的 build-tools 34.0.0，实际为："
+            grep "Build-Tools =" build_log.txt || true
+            exit 1
+          fi
+          if ! grep -q "android.jar = .*/platforms/android-34/android\.jar" build_log.txt; then
+            echo "::error::构建未使用锁定的 android-34/android.jar，实际为："
+            grep "android.jar =" build_log.txt || true
+            exit 1
+          fi
+          echo "工具链校验通过：build-tools 34.0.0 + android-34 + NDK 26.1.10909125"
+
           ls -la feishu-antirecall.apk
           sha256sum feishu-antirecall.apk | tee sha256sum.txt
           mkdir -p dist
