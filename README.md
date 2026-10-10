@@ -80,6 +80,18 @@ build.sh / build.ps1    一键构建（Linux / Windows）
 - `防已读-逆向结论-v7.69.6.md` / `防已读-复盘-从native碰墙到Java破局.md`
 - [CONTRIBUTING.md](CONTRIBUTING.md) —— 怎么给新版本重新定位偏移并提 PR
 
+### 已知支持版本（实测）
+
+| 飞书/Lark 版本 | versionCode | 消息库 | messages 建表序 | 状态 |
+|---|---|---|---|---|
+| ≤ 7.70.x | ≤ 7700000 | `libsqlcipher.so` | id=0 chat_id=1 **content=9 cid=12** recalled=14 **is_visible=30** | 支持 |
+| **7.72.10**（含 MiworkProX64 白标） | **7721050** | `libwcdb2.so` / `libsqlcipher.so` 双库 | id=0 chat_id=1 **content=6 cid=16** recalled=14 **is_visible=31** | 支持（本分支适配） |
+| 8.x（8.1.12 实测） | ≥ 8000000 | `libwcdb2.so` | 运行时解析 | 支持 |
+
+> `messages` / `feed_channel` 的列位以**运行时解析 SQL 列名表为主路径**（`REPLACE INTO \`messages\` (\`id\`,\`chat_id\`,…)`），
+> 只有解析不到列名表时才回退到"按 versionCode 选的兜底列序"。因此大多数版本升级**无需改代码**；
+> 新增不兼容版本时，优先补 `COLS_*` / `FEED_*` 兜底常量（`native/jni/antirecall.cpp`）。
+
 ## 双版本发布（legacy / api102）
 
 自 v1.8.9 起维护两条线，**功能一致、包名相同、同一签名**（可互相覆盖安装，数据不丢）：

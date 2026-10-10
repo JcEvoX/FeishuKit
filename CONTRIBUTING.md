@@ -21,6 +21,38 @@
 4. **落地**：把新偏移 / 新混淆符号写进对应 hook（`native/jni/` 或 `app/.../*.java`），做**版本自适应**（按 `versionCode` 分支，别写死一个版本）。
 5. **验证矩阵**：注明你测过的飞书版本号 + 设备 / Android 版本，PR 描述里贴上。
 
+### 先查建表序，再动列位（重要）
+
+`messages` / `feed_channel` 的**列序会随版本变**（例：7.72.10 把 `messages.content` 从第 9 位移到第 6 位）。
+这类改动**不需要 IDA**，直接在 `liblark.so` 里搜建表语句就能拿到权威列序：
+
+```bash
+# 在 liblark.so 里定位建表 SQL（附带完整列定义，顺序即 0-based 列位）
+python3 - <<'PY'
+import re
+raw = open('liblark.so','rb').read()
+for tbl in (b'messages', b'feed_channel'):
+    m = re.search(rb'CREATE TABLE\s+`?' + tbl + rb'`?\s*\(', raw)
+    if m:
+        s = raw[m.start():m.start()+4000].decode('utf-8','replace')
+        s = s[:s.find(');')]
+        cols = re.findall(r'^\s*,?\s*([a-zA-Z_]\w*)\s+(BIGINT|INTEGER|TEXT|BLOB|BOOLEAN|REAL|DOUBLE)', s, re.M)
+        print(f'--- {tbl.decode()} ({len(cols)} 列) ---')
+        for i,(n,t) in enumerate(cols): print(f'{i:3d}  {n:28s} {t}')
+PY
+```
+
+拿到列位后：
+- **优先**依赖运行时的**列名表解析**（`REPLACE INTO \`messages\` (\`id\`,\`chat_id\`,…)`）—— 它自动适配，无需改代码；
+- 只有当解析**失败**才用兜底常量。新版本建表序与现有兜底不同时，**补一组 `COLS_*` / `FEED_*` 常量并按 `versionCode` 选中**
+  （见 `native/jni/antirecall.cpp` 的 `COLS_V7` / `COLS_V77210` / `pick_fallback_cols()`），别直接改掉旧常量导致老版本回归。
+
+### 白标包名
+
+企业二次开发 / 白标版会改 `applicationId`（例：`com.ss.android.lark.saxmsa667`），
+`isLarkFamily()` 认不出。确认 `isLarkApp()` 的类探测（`com.bytedance.lark.sdk.Sdk` /
+`com.bytedance.lark.pb.basic.v1.Command`）在目标包里存在即可，无需为每个白标加包名白名单。
+
 ## 代码规范
 
 - 保持现有风格；注释可中文。

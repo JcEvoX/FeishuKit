@@ -169,16 +169,30 @@ static volatile int g_export_cnt = 0;
 
 // ── messages 表 REPLACE 语句的列位(0-based) —— 运行时自适应 ──────────────
 // 7.x 固定列序: 0 id, 1 chat_id, 9 content, 12 cid, 14 is_recalled, 30 is_visible。
+// 7.72.10 建表序改变(实测 liblark CREATE TABLE messages): 0 id, 1 chat_id, 6 content(BLOB),
+//   16 cid, 14 is_recalled, 31 is_visible —— 旧兜底 9/12/30 会改错列 -> 必须按版本给兜底。
 // 8.x 起 ORM 的 SQL 改为运行时拼接、liblark.so 里无静态模板, 列序随时可变 -> 不再写死:
 // 见到 messages 的 REPLACE 语句时现场解析其 SQL 列名表(REPLACE INTO `messages`
-// (`id`,`chat_id`,...) VALUES (...)), 解析不到(无列名表/认不出)回退 7.x 旧列序。
+// (`id`,`chat_id`,...) VALUES (...)), 解析不到(无列名表/认不出)回退"本版本实测列序"。
 // 绑定参数序 = 列位 + 1 (SQLite 1-based)。
 struct MsgCols { int id, chat, content, cid, recalled, visible; };   // -1 = 该列不在本语句列名表
-static const MsgCols COLS_V7 = { 0, 1, 9, 12, 14, 30 };              // 7.x 实测列序(兜底)
+static const MsgCols COLS_V7    = { 0, 1,  9, 12, 14, 30 };  // 7.x 早期(<=7.70)实测列序(兜底)
+static const MsgCols COLS_V77210 = { 0, 1,  6, 16, 14, 31 };  // 7.72.10 建表序(content 提前到 6,
+                                                              //   cid=16, is_visible=31)
 static MsgCols g_mc = COLS_V7;
 static volatile int g_mc_parsed = 0;    // 1=已从运行时 SQL 解析出列序(非兜底值)
 static pthread_mutex_t g_mc_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned g_mc_hash = 0;          // 最近成功解析的模板哈希(同模板只解析一次)
+
+// 由 Java 在启动时经 nativeSetFeishuVersion 传入目标飞书 versionCode; 未设(=0)则用最保守兜底。
+// 用途: 只在"运行时解析列名表失败"时才用到兜底值, 选错版本会改错列 -> 必须精确。
+static volatile long long g_feishu_vc = 0;
+// 7721050 = 7.72.10 (MiworkProX64 样本实测)。以 7721000 为界: >= 该值用新列序。
+static void pick_fallback_cols() {
+    if (g_mc_parsed) return;                     // 已解析出真实列位, 不动
+    if (g_feishu_vc >= 7721000LL) g_mc = COLS_V77210;
+    else                          g_mc = COLS_V7;
+}
 
 static unsigned str_hash32(const char *s) {
     unsigned h = 2166136261u;
@@ -404,7 +418,57 @@ static long long find_num(const char *s, const char *key) {
     return v;
 }
 
-// 解析 feed_channel 的 VALUES: 取第0个(id) 与 第9个(new_message_count, 0-based).
+// 解析 feed_channel 的 VALUES: 取第0个(id) 与 new_message_count 列.
+// 7.x 建表序 new_message_count 在第 9 位; 7.72.10 起前面多了若干列 -> 在第 10 位。
+// 与 messages 同样走"运行时解析列名表优先, 失败回退版本兜底"。
+struct FeedCols { int id, nmc; };
+static const FeedCols FEED_V7    = { 0,  9 };   // <=7.70 建表序
+static const FeedCols FEED_V77210 = { 0, 10 };  // 7.72.10 建表序(new_message_count=10)
+static FeedCols g_fc = FEED_V7;
+static volatile int g_fc_parsed = 0;
+static pthread_mutex_t g_fc_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned g_fc_hash = 0;
+
+static void pick_fallback_feed() {
+    if (g_fc_parsed) return;
+    if (g_feishu_vc >= 7721000LL) g_fc = FEED_V77210;
+    else                          g_fc = FEED_V7;
+}
+// 解析 feed_channel 的列名表(REPLACE INTO `feed_channel` (`id`,...,`new_message_count`,...))
+static void adapt_feed_cols(const char *tmpl, const char *cols) {
+    unsigned h = str_hash32(tmpl);
+    if (h == g_fc_hash) return;
+    pthread_mutex_lock(&g_fc_lock);
+    if (h == g_fc_hash) { pthread_mutex_unlock(&g_fc_lock); return; }
+    FeedCols fc = { -1, -1 };
+    int n = 0;
+    const char *p = cols;
+    while (p && *p && *p != ')') {
+        const char *s = p;
+        while (*p && *p != ',' && *p != ')') p++;
+        while (s < p && (*s == ' ' || *s == '`')) s++;
+        const char *e2 = p;
+        while (e2 > s && (e2[-1] == ' ' || e2[-1] == '`')) e2--;
+        char name[40]; int l = (int) (e2 - s);
+        if (l > (int) sizeof name - 1) l = (int) sizeof name - 1;
+        if (l > 0) {
+            memcpy(name, s, (size_t) l); name[l] = 0;
+            if      (strcmp(name, "id") == 0)                fc.id  = n;
+            else if (strcmp(name, "new_message_count") == 0) fc.nmc = n;
+        }
+        n++;
+        if (*p == ',') p++;
+    }
+    if (fc.id >= 0 && fc.nmc >= 0) {
+        bool changed = (fc.id != g_fc.id || fc.nmc != g_fc.nmc);
+        g_fc = fc; g_fc_parsed = 1; g_fc_hash = h;
+        if (changed) {
+            LOGI("STEALTH-READ: feed_channel 列位自适应 id=%d new_message_count=%d (共%d列)", fc.id, fc.nmc, n);
+            flog("防已读: feed_channel 列序已自适应 id=%d new_message_count=%d", fc.id, fc.nmc);
+        }
+    }
+    pthread_mutex_unlock(&g_fc_lock);
+}
 static bool feed_parse(const char *e, uint64_t *id, long long *nmc) {
     const char *v = strstr(e, "VALUES ("); if (!v) return false; v += 8;
     int field = 0; bool inq = false; const char *fs = v; bool gotid = false, gotn = false;
@@ -415,8 +479,8 @@ static bool feed_parse(const char *e, uint64_t *id, long long *nmc) {
             const char *q = fs; while (q < p && *q == ' ') q++;
             long long x = 0; bool ok = false;
             while (q < p && *q >= '0' && *q <= '9') { x = x * 10 + (*q - '0'); q++; ok = true; }
-            if (field == 0 && ok) { *id = (uint64_t) x; gotid = true; }
-            else if (field == 9 && ok) { *nmc = x; gotn = true; }
+            if (field == g_fc.id && ok) { *id = (uint64_t) x; gotid = true; }
+            else if (field == g_fc.nmc && ok) { *nmc = x; gotn = true; }
             if (c == ')') break;
             field++; fs = p + 1;
         }
@@ -1116,6 +1180,9 @@ static int step_common(SqlProv *pv, void *stmt) {
                 pv->free_fn(e);
             }
         } else if (strncmp(t, "REPLACE INTO `feed_channel`", 27) == 0) {
+            // 列名表自带时先自适应(feed_channel 建表序随版本变: 7.x nmc=9, 7.72.10 nmc=10)
+            char *sq = pv->sql ? (char *) pv->sql(stmt) : nullptr;     // 原始 SQL(含列名表)
+            if (sq) { const char *cp = strchr(sq, '('); if (cp) adapt_feed_cols(sq, cp + 1); }
             char *e = pv->exp ? pv->exp(stmt) : nullptr;
             if (e) {
                 uint64_t id = 0; long long nmc = -1;
@@ -1131,7 +1198,7 @@ static int step_common(SqlProv *pv, void *stmt) {
                         }
                     pthread_mutex_unlock(&g_chats_lock);
                     if (desired >= 0 && desired != (int) nmc) {
-                        pv->bind64(stmt, 10, (long long) desired);   // new_message_count = 本地真实未读
+                        pv->bind64(stmt, g_fc.nmc + 1, (long long) desired);   // new_message_count = 本地真实未读
                         static volatile int bf = 0; int b = ++bf;
                         if (b <= 8) LOGI("STEALTH-READ badge: feed_channel new_message_count %lld->%d (chat=%llu)",
                                           nmc, desired, (unsigned long long) id);
@@ -1685,6 +1752,7 @@ static void install_probe() {
     uintptr_t base = find_base("liblark.so");
     if (!base) return;                       // liblark 还没加载, 下次再试
     g_lark_base = base;
+    pick_fallback_cols();                    // 目标版本已由 Java 传入 -> 选定兜底列序
     int n = 0;
     // ── 防已读 stealth-read (已验证): hook frontier 终端入队丢回执 ──
     if (g_stealth_read && !g_649_installed) {
@@ -1781,6 +1849,17 @@ Java_com_chekayo_feishuantirecall_AntiRecall_nativeSetDataDir(JNIEnv *env, jclas
         g_data_dir[sizeof g_data_dir - 1] = 0;
         env->ReleaseStringUTFChars(d, c);
     }
+}
+
+// Java 侧在启动时传入目标飞书 versionCode(如 7.72.10 = 7721050)。
+// 仅用于"运行时列名表解析失败"时的兜底列序选择 —— 版本不同 messages 建表序不同。
+extern "C" JNIEXPORT void JNICALL
+Java_com_chekayo_feishuantirecall_AntiRecall_nativeSetFeishuVersion(JNIEnv *, jclass, jlong vc) {
+    g_feishu_vc = (long long) vc;
+    pick_fallback_cols();
+    pick_fallback_feed();
+    LOGI("ANTIRECALL: target feishu versionCode=%lld -> fallback cols id=%d chat=%d content=%d cid=%d recalled=%d visible=%d",
+         g_feishu_vc, g_mc.id, g_mc.chat, g_mc.content, g_mc.cid, g_mc.recalled, g_mc.visible);
 }
 
 // Java 维护线程轮询取一条待弹的"退群/被移除"提醒(无则返回 null)。
