@@ -96,6 +96,24 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
     /** JNI: 设当前目标包的 files 目录(国内/国际版自适应), native 据此拼日志/kicked/leave 路径。 */
     public static native void nativeSetDataDir(String dir);
 
+    /**
+     * JNI: 传入目标飞书 versionCode(如 7.72.10 = 7721050)。
+     * native 侧的 messages / feed_channel 列位以"运行时解析 SQL 列名表"为主路径;
+     * 仅当解析失败时才回退到按版本选的兜底列序 —— 7.72.10 起 messages 建表序
+     * (content=6/cid=16/is_visible=31)与 7.x 早期(9/12/30)不同, 传错会改错列。
+     */
+    public static native void nativeSetFeishuVersion(long versionCode);
+
+    /** 取目标飞书 versionCode(getPackageInfo 未就绪时返回 0, native 用最保守兜底)。 */
+    static int feishuVersionCode() {
+        try {
+            Object app = XposedHelpers.callStaticMethod(
+                    Class.forName("android.app.AndroidAppHelper"), "currentApplication");
+            android.content.Context ctx = (android.content.Context) app;
+            return ctx.getPackageManager().getPackageInfo(PKG, 0).versionCode;
+        } catch (Throwable t) { return 0; }
+    }
+
     @Override
     public void initZygote(IXposedHookZygoteInit.StartupParam sp) {
         MODULE_PATH = sp.modulePath;
@@ -553,6 +571,14 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
             try { nativeSetDataDir(filesDir.getAbsolutePath()); } catch (Throwable ignored) {}
         }
         try { nativeSetDataDir(AccountPaths.accountRoot(null, PKG, AccountPaths.currentUid).getAbsolutePath()); } catch (Throwable ignored) {}
+
+        // 目标飞书版本 -> native 兜底列序选择(messages/feed_channel 建表序随版本变)。
+        // 必须在 Installer 线程首次调用 tryInstall() 之前设好。
+        try {
+            int vc = feishuVersionCode();
+            nativeSetFeishuVersion(vc);
+            XposedBridge.log("[antirecall] target versionCode=" + vc);
+        } catch (Throwable t) { XposedBridge.log("[antirecall] setFeishuVersion err " + t); }
 
         // FeishuKit: 读配置 + 与模块权威源对齐 + 按开关设防撤回/诊断状态
         // 注意: 不能只 load() 本地旧文件——会把刚同步到的配置冲掉
